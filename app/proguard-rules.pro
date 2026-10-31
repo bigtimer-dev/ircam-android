@@ -1,0 +1,1 @@
+-keep class io.github.bigtimer_dev.ircam.usb.NativeUvc { native <methods>; }

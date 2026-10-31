@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- InfiRay P2 / P2 Pro / Tiny1-C, TOPDON TC001 (Realtek bridge 0bda:5830) -->
+    <usb-device vendor-id="3034" product-id="22576" />
+</resources>
