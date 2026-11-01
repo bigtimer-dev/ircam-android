@@ -5,6 +5,14 @@ An Android app for USB thermal cameras, ported from
 [OpenRMH-IRCAM](https://github.com/Cyclotronic/OpenRMH-IRCAM). Plug the camera into the phone's
 USB-C port and the app opens with a live radiometric view.
 
+## Screenshots
+
+Live from an InfiRay P2 Pro on a Samsung Galaxy A04:
+
+| Spots and a box (Iron palette) | Turbo palette | Settings |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/spots.png" width="240" alt="Live view with three spots and a measurement box"> | <img src="docs/screenshots/turbo.png" width="240" alt="Live view with the Turbo palette"> | <img src="docs/screenshots/settings.png" width="240" alt="Measurement settings"> |
+
 ## Install
 
 Download `IRCAM-Thermal-<version>.apk` from the releases page, open it on the phone and allow
