@@ -16,6 +16,8 @@ This first version supports the **pool 2** family: InfiRay P2 / P2 Pro / Tiny1-C
 (USB `0bda:5830`). Other cameras that stream 256×384 YUYV with the same layout should work too.
 Temperature range switching (Low/High) works on the P2 Pro.
 
+Tested with an InfiRay P2 Pro on a Samsung Galaxy A04 (MediaTek MT6765, Android 15 GSI) at 25 fps.
+
 ## Features
 
 - Live view with hottest, coldest and centre markers and large readouts
