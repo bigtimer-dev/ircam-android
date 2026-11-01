@@ -36,6 +36,11 @@ fun IrcamApp(vm: CameraViewModel) {
     LaunchedEffect(Unit) {
         vm.messages.collectLatest { snackbar.showSnackbar(it) }
     }
+    val camPerm = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { vm.onCameraPermission(it) }
+    val needCam by vm.needCameraPermission.collectAsState()
+    LaunchedEffect(needCam) { if (needCam != null) camPerm.launch(android.Manifest.permission.CAMERA) }
 
     androidx.compose.material3.Surface(color = Ui.Bg, contentColor = Ui.Text) { Box(Modifier.fillMaxSize()) {
         when (screen) {

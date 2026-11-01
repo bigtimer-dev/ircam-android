@@ -1,3 +1,4 @@
+#include <stdio.h>
 /*
  * Minimal UVC streaming client on top of libusb, for raw YUYV thermal frames.
  *
@@ -60,6 +61,10 @@ struct uvc_cam {
     size_t assembled;
     int fid;
     int frame_error;
+    int frame_done;
+    /* packet-length lag detection (see on_transfer) */
+    uint32_t prev_len[ISO_PACKETS];
+    int have_prev, lag_mode, votes_own, votes_prev, calib_xfers;
 
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -67,6 +72,9 @@ struct uvc_cam {
     uint64_t seq;
     uint64_t delivered;
     uint64_t dropped;
+    /* diagnostics */
+    uint64_t st_xfers, st_pkts, st_pkt_err, st_empty, st_bytes, st_eof, st_fidflip, st_lastsize, st_xfer_err;
+    int st_last_status;
     char err[160];
 };
 
@@ -150,12 +158,20 @@ static int parse_descriptors(uvc_cam *c, int want_w, int want_h) {
     return 0;
 }
 
+/*
+ * Pick the isochronous alternate setting: the smallest single-transaction endpoint that carries
+ * the stream (frame bytes x fps / 8000 microframes, plus headroom), so we do not reserve a
+ * high-bandwidth slot the camera never fills; otherwise the smallest one >= the payload size.
+ */
 static int choose_iso_alt(uvc_cam *c) {
     struct libusb_config_descriptor *cfg = NULL;
     int r = libusb_get_active_config_descriptor(libusb_get_device(c->h), &cfg);
     if (r < 0) { set_err(c, "read config descriptor", r); return r; }
-    int best_alt = -1, best_size = 0, best_ep = 0;
-    int max_alt = -1, max_size = 0, max_ep = 0;
+    double fps = c->interval ? 1e7 / c->interval : 30.0;
+    int need = (int) ((double) c->frame_size * fps / 8000.0 * 1.3) + 64;
+    int single_alt = -1, single_size = 0, single_ep = 0; /* smallest mult=1 alt >= need, else largest mult=1 */
+    int single_max_alt = -1, single_max = 0, single_max_ep = 0;
+    int any_alt = -1, any_size = 0, any_ep = 0;          /* smallest alt >= payload size (any mult) */
     for (int i = 0; i < cfg->bNumInterfaces; i++) {
         const struct libusb_interface *itf = &cfg->interface[i];
         for (int a = 0; a < itf->num_altsetting; a++) {
@@ -166,22 +182,27 @@ static int choose_iso_alt(uvc_cam *c) {
                 if ((ep->bmAttributes & 3) != LIBUSB_TRANSFER_TYPE_ISOCHRONOUS || !(ep->bEndpointAddress & 0x80))
                     continue;
                 int mps = ep->wMaxPacketSize;
-                int size = (mps & 0x7FF) * (1 + ((mps >> 11) & 3));
-                /* SuperSpeed companion descriptors are not handled; USB 2 cameras only */
-                if (size >= (int) c->payload_size && (best_alt < 0 || size < best_size)) {
-                    best_alt = d->bAlternateSetting; best_size = size; best_ep = ep->bEndpointAddress;
+                int base = mps & 0x7FF, mult = 1 + ((mps >> 11) & 3);
+                int size = base * mult;
+                LOGI("alt %d: ep 0x%02x %d x %d = %d bytes", d->bAlternateSetting, ep->bEndpointAddress, mult, base, size);
+                if (mult == 1) {
+                    if (size >= need && (single_alt < 0 || size < single_size)) {
+                        single_alt = d->bAlternateSetting; single_size = size; single_ep = ep->bEndpointAddress;
+                    }
+                    if (size > single_max) { single_max_alt = d->bAlternateSetting; single_max = size; single_max_ep = ep->bEndpointAddress; }
                 }
-                if (size > max_size) { max_alt = d->bAlternateSetting; max_size = size; max_ep = ep->bEndpointAddress; }
+                if (size >= (int) c->payload_size && (any_alt < 0 || size < any_size)) {
+                    any_alt = d->bAlternateSetting; any_size = size; any_ep = ep->bEndpointAddress;
+                }
             }
         }
     }
     libusb_free_config_descriptor(cfg);
-    if (best_alt < 0) { best_alt = max_alt; best_size = max_size; best_ep = max_ep; }
-    if (best_alt < 0) { set_err(c, "no isochronous endpoint", 0); return -1; }
-    c->alt = best_alt;
-    c->pkt_size = best_size;
-    c->ep = (uint8_t) best_ep;
-    LOGI("iso alt %d, packet %d bytes, ep 0x%02x", c->alt, c->pkt_size, c->ep);
+    if (single_alt < 0 && single_max >= need * 10 / 13) { single_alt = single_max_alt; single_size = single_max; single_ep = single_max_ep; }
+    if (single_alt >= 0) { c->alt = single_alt; c->pkt_size = single_size; c->ep = (uint8_t) single_ep; }
+    else if (any_alt >= 0) { c->alt = any_alt; c->pkt_size = any_size; c->ep = (uint8_t) any_ep; }
+    else { set_err(c, "no isochronous endpoint", 0); return -1; }
+    LOGI("iso alt %d, packet %d bytes, ep 0x%02x (need ~%d per microframe)", c->alt, c->pkt_size, c->ep, need);
     return 0;
 }
 
@@ -228,6 +249,7 @@ static int negotiate(uvc_cam *c) {
 /* ------------------------------------------------------------------ payloads */
 
 static void finish_frame(uvc_cam *c) {
+    c->st_lastsize = c->assembled;
     if (c->assembled == c->frame_size && !c->frame_error) {
         pthread_mutex_lock(&c->lock);
         memcpy(c->latest, c->assemble, c->frame_size);
@@ -241,17 +263,23 @@ static void finish_frame(uvc_cam *c) {
     c->frame_error = 0;
 }
 
+/*
+ * Frames end at the payload with the EOF bit. The FID bit is not used for framing: the
+ * InfiRay P2 Pro toggles it about 20 KB after a new frame has already started, while its
+ * EOF bit marks the 196608-byte boundary correctly. Overflow without EOF resynchronises.
+ */
 static void handle_payload(uvc_cam *c, const uint8_t *p, int n) {
     if (n < 2) return;
     int hl = p[0];
     if (hl < 2 || hl > n) return;
     int info = p[1];
     int fid = info & 1;
-    if (c->fid >= 0 && fid != c->fid && c->assembled) finish_frame(c);
+    if (c->fid >= 0 && fid != c->fid) c->st_fidflip++;
     c->fid = fid;
     if (info & 0x40) c->frame_error = 1;
     int data = n - hl;
     if (data > 0) {
+        c->st_bytes += data;
         if (c->assembled + data <= c->frame_size) {
             memcpy(c->assemble + c->assembled, p + hl, data);
             c->assembled += data;
@@ -259,24 +287,69 @@ static void handle_payload(uvc_cam *c, const uint8_t *p, int n) {
             c->frame_error = 1;
         }
     }
-    if (info & 0x02) finish_frame(c);
+    if (info & 0x02) { c->st_eof++; finish_frame(c); }
+}
+
+/*
+ * Some phone kernels (seen on the MediaTek MT6765 Galaxy A04) return each isochronous transfer
+ * with the packet lengths of the transfer completed before it, while the data is correct. The
+ * buffer past a packet's real end is left zeroed, so for the first transfers we check whether
+ * the data ends where this transfer's lengths say or where the previous one's do, and then use
+ * whichever matches.
+ */
+static int data_end(const uint8_t *p, int size) {
+    int run = 0;
+    for (int j = 12; j < size; j++) {
+        if (p[j] == 0) { if (++run == 8) return j - 7; } else run = 0;
+    }
+    return size;
+}
+
+static void calibrate_lag(uvc_cam *c, struct libusb_transfer *t, int np) {
+    if (c->have_prev) {
+        for (int i = 0; i < np; i++) {
+            unsigned own = t->iso_packet_desc[i].actual_length, prev = c->prev_len[i];
+            if (own == prev || own < 16 || prev < 16 || own > (unsigned) c->pkt_size - 8 || prev > (unsigned) c->pkt_size - 8) continue;
+            int end = data_end(libusb_get_iso_packet_buffer_simple(t, i), c->pkt_size);
+            if (end == (int) own) c->votes_own++;
+            else if (end == (int) prev) c->votes_prev++;
+        }
+    }
+    int total = c->votes_own + c->votes_prev;
+    if (total >= 64 || ++c->calib_xfers >= 64) {
+        c->lag_mode = c->votes_prev > c->votes_own * 4 ? 1 : 0;
+        LOGI("packet lengths: %s (votes own %d, previous %d)",
+             c->lag_mode ? "lagging one transfer, compensating" : "normal", c->votes_own, c->votes_prev);
+    }
 }
 
 static void LIBUSB_CALL on_transfer(struct libusb_transfer *t) {
     uvc_cam *c = t->user_data;
+    c->st_xfers++;
+    if (t->status != LIBUSB_TRANSFER_COMPLETED) { c->st_xfer_err++; c->st_last_status = t->status; }
     if (t->status == LIBUSB_TRANSFER_COMPLETED) {
         if (t->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
-            for (int i = 0; i < t->num_iso_packets; i++) {
+            int np = t->num_iso_packets < ISO_PACKETS ? t->num_iso_packets : ISO_PACKETS;
+            if (c->lag_mode < 0) calibrate_lag(c, t, np);
+            for (int i = 0; i < np; i++) {
                 struct libusb_iso_packet_descriptor *pd = &t->iso_packet_desc[i];
-                if (pd->status != LIBUSB_TRANSFER_COMPLETED || !pd->actual_length) continue;
-                handle_payload(c, libusb_get_iso_packet_buffer_simple(t, i), pd->actual_length);
+                c->st_pkts++;
+                if (pd->status != LIBUSB_TRANSFER_COMPLETED) { c->st_pkt_err++; c->st_last_status = 100 + pd->status; continue; }
+                unsigned len = c->lag_mode == 1 ? c->prev_len[i] : pd->actual_length;
+                if (c->lag_mode < 0) continue; /* still deciding which lengths are right */
+                if (!len) { c->st_empty++; continue; }
+                if (len > (unsigned) c->pkt_size) len = (unsigned) c->pkt_size;
+                handle_payload(c, libusb_get_iso_packet_buffer_simple(t, i), (int) len);
             }
+            for (int i = 0; i < np; i++) c->prev_len[i] = t->iso_packet_desc[i].actual_length;
+            c->have_prev = 1;
         } else if (t->actual_length > 0) {
             /* a bulk transfer holds one payload (dwMaxPayloadTransferSize bytes max) */
             handle_payload(c, t->buffer, t->actual_length);
         }
     }
     if (c->running && (t->status == LIBUSB_TRANSFER_COMPLETED || t->status == LIBUSB_TRANSFER_TIMED_OUT)) {
+        memset(t->buffer, 0xEE, t->length);
         if (libusb_submit_transfer(t) == 0) return;
     }
     if (t->status == LIBUSB_TRANSFER_NO_DEVICE) c->running = 0;
@@ -286,8 +359,19 @@ static void LIBUSB_CALL on_transfer(struct libusb_transfer *t) {
 static void *event_thread(void *arg) {
     uvc_cam *c = arg;
     struct timeval tv = {0, 100000};
+    struct timespec last, now;
+    clock_gettime(CLOCK_MONOTONIC, &last);
     while (c->running || c->active > 0) {
         libusb_handle_events_timeout_completed(c->ctx, &tv, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - last.tv_sec >= 10) {
+            last = now;
+            LOGI("stats: xfers %llu (err %llu) pkts %llu (err %llu, empty %llu) bytes %llu eof %llu fidflip %llu frames %llu dropped %llu lastsize %llu laststatus %d active %d",
+                 (unsigned long long) c->st_xfers, (unsigned long long) c->st_xfer_err, (unsigned long long) c->st_pkts,
+                 (unsigned long long) c->st_pkt_err, (unsigned long long) c->st_empty, (unsigned long long) c->st_bytes,
+                 (unsigned long long) c->st_eof, (unsigned long long) c->st_fidflip, (unsigned long long) c->seq,
+                 (unsigned long long) c->dropped, (unsigned long long) c->st_lastsize, c->st_last_status, c->active);
+        }
     }
     pthread_mutex_lock(&c->lock);
     pthread_cond_broadcast(&c->cond);
@@ -338,6 +422,8 @@ int uvc_start(uvc_cam *c) {
     c->running = 1;
     c->assembled = 0;
     c->fid = -1;
+    c->lag_mode = c->iso ? -1 : 0;
+    c->have_prev = c->votes_own = c->votes_prev = c->calib_xfers = 0;
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         struct libusb_transfer *t;
         if (c->iso) {

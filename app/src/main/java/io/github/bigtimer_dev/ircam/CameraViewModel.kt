@@ -185,8 +185,24 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         requestOrConnect(dev)
     }
 
+    /** Set when Android needs the CAMERA permission before it will grant USB access (UVC devices). */
+    private val _needCameraPermission = MutableStateFlow<UsbDevice?>(null)
+    val needCameraPermission = _needCameraPermission.asStateFlow()
+
+    fun onCameraPermission(granted: Boolean) {
+        val dev = _needCameraPermission.value ?: return
+        _needCameraPermission.value = null
+        if (granted) requestOrConnect(dev)
+        else _state.value = CamState.Idle(true, "Android requires the Camera permission to use a USB thermal camera.")
+    }
+
     private fun requestOrConnect(dev: UsbDevice) {
         if (usb.hasPermission(dev)) { connect(dev); return }
+        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            _state.value = CamState.Idle(true, null)
+            _needCameraPermission.value = dev
+            return
+        }
         val pi = PendingIntent.getBroadcast(
             ctx, 0, Intent(ACTION_PERMISSION).setPackage(ctx.packageName),
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
