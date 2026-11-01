@@ -6,10 +6,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.display.DisplayManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.view.Display
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -76,6 +80,21 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private val _frame = MutableStateFlow<FrameResult?>(null)
     val frame: StateFlow<FrameResult?> = _frame.asStateFlow()
     private val _settings = MutableStateFlow(store.load())
+
+    // The camera is plugged into the phone, so it turns with it. The rotation setting is the
+    // image orientation with the phone upright; the screen's rotation is added on top so the
+    // scene stays upright when the phone is turned. While recording, the rotation is kept fixed
+    // (the video frame size cannot change).
+    private val displays = app.getSystemService(DisplayManager::class.java)
+    @Volatile private var displayRot = currentDisplayRotation()
+    @Volatile private var frozenDisplayRot: Int? = null
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(id: Int) {}
+        override fun onDisplayRemoved(id: Int) {}
+        override fun onDisplayChanged(id: Int) {
+            if (id == Display.DEFAULT_DISPLAY) setDisplayRotation(currentDisplayRotation())
+        }
+    }
     val settings = _settings.asStateFlow()
     /** Measurement parameters in use: the saved ones live, the file's ones in analysis. */
     private val _params = MutableStateFlow(_settings.value.params)
@@ -135,6 +154,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
+        displays.registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
         val f = IntentFilter().apply {
             addAction(ACTION_PERMISSION)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
@@ -277,7 +297,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     while (times.size > 1 && now - times.first() > 2_000_000_000L) times.removeFirst()
                     val fps = if (times.size > 1) (times.size - 1) * 1e9 / (now - times.first()) else 0.0
                     frames++
-                    val s = _settings.value
+                    val s = effective(_settings.value)
                     val res = synchronized(lock) {
                         lastRaw = if (src.live) raw.copyOf() else raw
                         processor.process(src.cam, raw, s, _spots.value, _boxes.value, frames, if (src.live) fps else 0.0)
@@ -350,7 +370,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun updateSettings(f: (Settings) -> Settings) {
         val old = _settings.value
         val new = f(old)
-        if (new.rotation != old.rotation || new.mirror != old.mirror) transformObjects(old, new)
+        val eo = effective(old); val en = effective(new)
+        if (en.rotation != eo.rotation || en.mirror != eo.mirror) transformObjects(eo, en)
         _settings.value = new
         store.save(new)
     }
@@ -364,6 +385,28 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun rotate() = updateSettings { it.copy(rotation = (it.rotation + 90) % 360) }
+
+    private fun currentDisplayRotation(): Int =
+        (displays.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: 0) * 90
+
+    /** Extra clockwise image rotation that cancels the phone's turn (the sign flips when mirrored). */
+    private fun compensation(s: Settings): Int {
+        if (_state.value is CamState.Analysis) return 0
+        val d = frozenDisplayRot ?: displayRot
+        return if (s.mirror) d else (360 - d) % 360
+    }
+
+    /** Settings as used for drawing: the user's rotation plus the screen compensation. */
+    private fun effective(s: Settings): Settings =
+        s.copy(rotation = (s.rotation + compensation(s)) % 360)
+
+    private fun setDisplayRotation(r: Int) {
+        if (r == displayRot) return
+        val old = effective(_settings.value)
+        displayRot = r
+        val new = effective(_settings.value)
+        if (new.rotation != old.rotation) transformObjects(old, new)
+    }
 
     /** Lock the colour range to what is shown now, or go back to automatic. */
     fun toggleRangeLock() {
@@ -452,7 +495,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val f = _frame.value ?: return
         val src = source ?: return
         val raw = synchronized(lock) { lastRaw?.copyOf() } ?: return
-        val s = _settings.value
+        val s = effective(_settings.value)
         val emi = _params.value.emissivity
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -499,6 +542,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Exception) {
                 media.discard(uri); throw e
             }
+            frozenDisplayRot = displayRot
             _recording.value = RecState(System.currentTimeMillis())
         } catch (e: Exception) {
             _messages.tryEmit("Could not start recording: ${e.message}")
@@ -509,6 +553,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val r = recorder ?: return
         recorder = null
         _recording.value = null
+        if (frozenDisplayRot != null) {
+            val old = effective(_settings.value)
+            frozenDisplayRot = null
+            val new = effective(_settings.value)
+            if (new.rotation != old.rotation) transformObjects(old, new)
+        }
         control.execute {
             val ok = r.stop()
             if (ok) { media.finishVideo(r.uri); _messages.tryEmit("Video saved to Movies/IRCAM") }
@@ -557,6 +607,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         stopSource()
         runCatching { ctx.unregisterReceiver(usbReceiver) }
+        displays.unregisterDisplayListener(displayListener)
         control.shutdown()
     }
 
