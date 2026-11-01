@@ -64,7 +64,7 @@ struct uvc_cam {
     int frame_done;
     /* packet-length lag detection (see on_transfer) */
     uint32_t prev_len[ISO_PACKETS];
-    int have_prev, lag_mode, votes_own, votes_prev, calib_xfers;
+    int have_prev, lag_mode, votes_own, votes_prev, calib_xfers, st_lag_switch;
 
     pthread_mutex_t lock;
     pthread_cond_t cond;
@@ -291,11 +291,11 @@ static void handle_payload(uvc_cam *c, const uint8_t *p, int n) {
 }
 
 /*
- * Some phone kernels (seen on the MediaTek MT6765 Galaxy A04) return each isochronous transfer
- * with the packet lengths of the transfer completed before it, while the data is correct. The
- * buffer past a packet's real end is left zeroed, so for the first transfers we check whether
- * the data ends where this transfer's lengths say or where the previous one's do, and then use
- * whichever matches.
+ * Some phone kernels (seen on the MediaTek MT6765 Galaxy A04) return isochronous transfers with
+ * the packet lengths of the transfer completed before them, while the data is correct; on the
+ * same phone this can come and go between sessions or start mid-stream. The buffer past a
+ * packet's real end is left zeroed, so every transfer is checked: does the data end where its
+ * own lengths say, or where the previous transfer's do? The mode follows the evidence.
  */
 static int data_end(const uint8_t *p, int size) {
     int run = 0;
@@ -305,21 +305,35 @@ static int data_end(const uint8_t *p, int size) {
     return size;
 }
 
-static void calibrate_lag(uvc_cam *c, struct libusb_transfer *t, int np) {
-    if (c->have_prev) {
-        for (int i = 0; i < np; i++) {
-            unsigned own = t->iso_packet_desc[i].actual_length, prev = c->prev_len[i];
-            if (own == prev || own < 16 || prev < 16 || own > (unsigned) c->pkt_size - 8 || prev > (unsigned) c->pkt_size - 8) continue;
-            int end = data_end(libusb_get_iso_packet_buffer_simple(t, i), c->pkt_size);
-            if (end == (int) own) c->votes_own++;
-            else if (end == (int) prev) c->votes_prev++;
-        }
+static void check_lag(uvc_cam *c, struct libusb_transfer *t, int np) {
+    if (!c->have_prev) return;
+    int own_v = 0, prev_v = 0, checked = 0;
+    for (int i = 0; i < np && checked < 8; i++) {
+        unsigned own = t->iso_packet_desc[i].actual_length, prev = c->prev_len[i];
+        if (own == prev || own < 16 || prev < 16 || own > (unsigned) c->pkt_size - 8 || prev > (unsigned) c->pkt_size - 8) continue;
+        checked++;
+        int end = data_end(libusb_get_iso_packet_buffer_simple(t, i), c->pkt_size);
+        if (end == (int) own) own_v++;
+        else if (end == (int) prev) prev_v++;
     }
-    int total = c->votes_own + c->votes_prev;
-    if (total >= 64 || ++c->calib_xfers >= 64) {
-        c->lag_mode = c->votes_prev > c->votes_own * 4 ? 1 : 0;
+    if (!own_v && !prev_v) return;
+    if (c->lag_mode < 0) {
+        c->votes_own += own_v; c->votes_prev += prev_v;
+        if (c->votes_own + c->votes_prev < 32) return;
+        c->lag_mode = c->votes_prev > c->votes_own ? 1 : 0;
+        c->calib_xfers = 0;
         LOGI("packet lengths: %s (votes own %d, previous %d)",
-             c->lag_mode ? "lagging one transfer, compensating" : "normal", c->votes_own, c->votes_prev);
+             c->lag_mode ? "lagging one transfer" : "normal", c->votes_own, c->votes_prev);
+        return;
+    }
+    int against = c->lag_mode ? own_v > prev_v : prev_v > own_v;
+    c->calib_xfers = against ? c->calib_xfers + 1 : 0; /* consecutive transfers contradicting the mode */
+    if (c->calib_xfers >= 2) {
+        c->lag_mode = !c->lag_mode;
+        c->calib_xfers = 0;
+        c->frame_error = 1; /* the frame being assembled is mixed up */
+        c->st_lag_switch++;
+        LOGI("packet lengths switched to %s", c->lag_mode ? "lagging one transfer" : "normal");
     }
 }
 
@@ -330,7 +344,7 @@ static void LIBUSB_CALL on_transfer(struct libusb_transfer *t) {
     if (t->status == LIBUSB_TRANSFER_COMPLETED) {
         if (t->type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
             int np = t->num_iso_packets < ISO_PACKETS ? t->num_iso_packets : ISO_PACKETS;
-            if (c->lag_mode < 0) calibrate_lag(c, t, np);
+            check_lag(c, t, np);
             for (int i = 0; i < np; i++) {
                 struct libusb_iso_packet_descriptor *pd = &t->iso_packet_desc[i];
                 c->st_pkts++;
@@ -366,11 +380,11 @@ static void *event_thread(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (now.tv_sec - last.tv_sec >= 10) {
             last = now;
-            LOGI("stats: xfers %llu (err %llu) pkts %llu (err %llu, empty %llu) bytes %llu eof %llu fidflip %llu frames %llu dropped %llu lastsize %llu laststatus %d active %d",
+            LOGI("stats: xfers %llu (err %llu) pkts %llu (err %llu, empty %llu) bytes %llu eof %llu fidflip %llu frames %llu dropped %llu lastsize %llu laststatus %d active %d lagmode %d switches %d",
                  (unsigned long long) c->st_xfers, (unsigned long long) c->st_xfer_err, (unsigned long long) c->st_pkts,
                  (unsigned long long) c->st_pkt_err, (unsigned long long) c->st_empty, (unsigned long long) c->st_bytes,
                  (unsigned long long) c->st_eof, (unsigned long long) c->st_fidflip, (unsigned long long) c->seq,
-                 (unsigned long long) c->dropped, (unsigned long long) c->st_lastsize, c->st_last_status, c->active);
+                 (unsigned long long) c->dropped, (unsigned long long) c->st_lastsize, c->st_last_status, c->active, c->lag_mode, c->st_lag_switch);
         }
     }
     pthread_mutex_lock(&c->lock);
@@ -423,7 +437,7 @@ int uvc_start(uvc_cam *c) {
     c->assembled = 0;
     c->fid = -1;
     c->lag_mode = c->iso ? -1 : 0;
-    c->have_prev = c->votes_own = c->votes_prev = c->calib_xfers = 0;
+    c->have_prev = c->votes_own = c->votes_prev = c->calib_xfers = c->st_lag_switch = 0;
     for (int i = 0; i < NUM_TRANSFERS; i++) {
         struct libusb_transfer *t;
         if (c->iso) {
