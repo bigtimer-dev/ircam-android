@@ -41,6 +41,10 @@ data class Settings(
     val lockHi: Double = 40.0,
     val params: MeasureParams = MeasureParams(),
     val emissivityMaterial: String = "Camera Default",
+    /** Address of the wireless P2 Pro bridge (host, host:port or IP). */
+    val wirelessHost: String = "p2pro.local",
+    /** Image rotation for the wireless camera (it is not attached to the phone). */
+    val wirelessRotation: Int = 0,
 )
 
 class SettingsStore(context: Context) {
@@ -73,6 +77,8 @@ class SettingsStore(context: Context) {
                 tempCorrection = dbl("tempCorrection", d.params.tempCorrection),
             ),
             emissivityMaterial = p.getString("material", d.emissivityMaterial) ?: d.emissivityMaterial,
+            wirelessHost = p.getString("wirelessHost", d.wirelessHost) ?: d.wirelessHost,
+            wirelessRotation = p.getInt("wirelessRotation", 0),
         )
     }
 
@@ -98,6 +104,8 @@ class SettingsStore(context: Context) {
             .putFloat("distance", s.params.distance.toFloat())
             .putFloat("tempCorrection", s.params.tempCorrection.toFloat())
             .putString("material", s.emissivityMaterial)
+            .putString("wirelessHost", s.wirelessHost)
+            .putInt("wirelessRotation", s.wirelessRotation)
             .apply()
     }
 }

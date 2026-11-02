@@ -27,6 +27,8 @@ import io.github.bigtimer_dev.ircam.thermal.Box
 import io.github.bigtimer_dev.ircam.thermal.DemoSource
 import io.github.bigtimer_dev.ircam.thermal.FrameResult
 import io.github.bigtimer_dev.ircam.thermal.FrameSource
+import io.github.bigtimer_dev.ircam.thermal.LinkStats
+import io.github.bigtimer_dev.ircam.thermal.NetworkSource
 import io.github.bigtimer_dev.ircam.thermal.Palettes
 import io.github.bigtimer_dev.ircam.thermal.Processor
 import io.github.bigtimer_dev.ircam.thermal.RawFiles
@@ -54,7 +56,7 @@ sealed interface CamState {
     /** No camera; [usbPresent] when a camera is plugged in but not yet permitted/opened. */
     data class Idle(val usbPresent: Boolean = false, val message: String? = null) : CamState
     data class Connecting(val name: String) : CamState
-    data class Live(val name: String, val canSwitchRange: Boolean, val demo: Boolean) : CamState
+    data class Live(val name: String, val canSwitchRange: Boolean, val demo: Boolean, val wireless: Boolean = false) : CamState
     data class Analysis(val item: SnapshotItem) : CamState
 }
 
@@ -130,6 +132,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private var paused = false
     /** What to go back to after analysis. */
     private var resumeDemo = false
+    /** Bridge address to reconnect to (wireless camera), or null. */
+    private var resumeWireless: String? = null
+    private val _link = MutableStateFlow<LinkStats?>(null)
+    /** Link quality while a wireless camera is live. */
+    val link = _link.asStateFlow()
 
     // ------------------------------------------------------------------ USB
 
@@ -234,12 +241,32 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     private fun connect(dev: UsbDevice) {
         liveDevice = dev
         resumeDemo = false
+        resumeWireless = null
         start(UsbPool2Source(usb, dev))
     }
 
     fun startDemo() {
         resumeDemo = true
+        resumeWireless = null
         start(DemoSource())
+    }
+
+    /** Connect to the P2 Pro on the wireless bridge (Raspberry Pi) at [host]. */
+    fun startWireless(host: String) {
+        val h = host.trim().ifEmpty { io.github.bigtimer_dev.ircam.net.Irw1.DEFAULT_HOST }
+        updateSettings { it.copy(wirelessHost = h) }
+        resumeDemo = false
+        resumeWireless = h
+        start(NetworkSource(h, wifiNetwork()))
+    }
+
+    /** The WiFi network (so a hotspot without internet is used instead of mobile data). */
+    @Suppress("DEPRECATION")
+    private fun wifiNetwork(): android.net.Network? {
+        val cm = ctx.getSystemService(android.net.ConnectivityManager::class.java) ?: return null
+        return cm.allNetworks.firstOrNull {
+            cm.getNetworkCapabilities(it)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
     }
 
     // ------------------------------------------------------------------ engine
@@ -261,7 +288,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             paramsDirty = live
             source = src
             if (live) {
-                _state.value = CamState.Live(src.name, src.canSwitchRange, src is DemoSource)
+                _state.value = CamState.Live(src.name, src.canSwitchRange, src is DemoSource, src is NetworkSource)
                 if (src.canSwitchRange) control.execute { _highRange.value = src.currentHighRange() }
                 else _highRange.value = null
             }
@@ -297,6 +324,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     while (times.size > 1 && now - times.first() > 2_000_000_000L) times.removeFirst()
                     val fps = if (times.size > 1) (times.size - 1) * 1e9 / (now - times.first()) else 0.0
                     frames++
+                    if (src is NetworkSource && frames % 12 == 0L) _link.value = src.linkStats()
                     val s = effective(_settings.value)
                     val res = synchronized(lock) {
                         lastRaw = if (src.live) raw.copyOf() else raw
@@ -351,6 +379,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         if (!paused) return
         paused = false
         if (resumeDemo) startDemo()
+        else if (resumeWireless != null) startWireless(resumeWireless!!)
         else {
             val dev = liveDevice?.takeIf { d -> usb.deviceList.values.any { it.deviceName == d.deviceName } }
             if (dev != null) requestOrConnect(dev) else _state.value = CamState.Idle(findCamera() != null)
@@ -361,7 +390,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         stopSource()
         liveDevice = null
         resumeDemo = false
+        resumeWireless = null
         _frame.value = null
+        _link.value = null
         _state.value = CamState.Idle(findCamera() != null)
     }
 
@@ -384,7 +415,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun rotate() = updateSettings { it.copy(rotation = (it.rotation + 90) % 360) }
+    fun rotate() = updateSettings {
+        if (isWireless()) it.copy(wirelessRotation = (it.wirelessRotation + 90) % 360)
+        else it.copy(rotation = (it.rotation + 90) % 360)
+    }
+
+    private fun isWireless() = (_state.value as? CamState.Live)?.wireless == true
 
     private fun currentDisplayRotation(): Int =
         (displays.getDisplay(Display.DEFAULT_DISPLAY)?.rotation ?: 0) * 90
@@ -392,13 +428,15 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     /** Extra clockwise image rotation that cancels the phone's turn (the sign flips when mirrored). */
     private fun compensation(s: Settings): Int {
         if (_state.value is CamState.Analysis) return 0
+        if ((_state.value as? CamState.Live)?.wireless == true) return 0   // the camera isn't on the phone
         val d = frozenDisplayRot ?: displayRot
         return if (s.mirror) d else (360 - d) % 360
     }
 
     /** Settings as used for drawing: the user's rotation plus the screen compensation. */
     private fun effective(s: Settings): Settings =
-        s.copy(rotation = (s.rotation + compensation(s)) % 360)
+        if (isWireless()) s.copy(rotation = s.wirelessRotation)   // its own orientation, no screen compensation
+        else s.copy(rotation = (s.rotation + compensation(s)) % 360)
 
     private fun setDisplayRotation(r: Int) {
         if (r == displayRot) return
@@ -582,6 +620,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             val wasDemo = _state.value.let { it is CamState.Live && it.demo }
             stopSource()
             if (wasDemo) resumeDemo = true
+            _link.value = null
             withContext(Dispatchers.IO) { src.open() }
             clearObjects()
             val c = src.cam
@@ -600,6 +639,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         _frame.value = null
         _state.value = CamState.Idle(findCamera() != null)
         if (resumeDemo) startDemo()
+        else if (resumeWireless != null) startWireless(resumeWireless!!)
         else liveDevice?.takeIf { d -> usb.deviceList.values.any { it.deviceName == d.deviceName } }?.let { requestOrConnect(it) }
             ?: autoStart()
     }

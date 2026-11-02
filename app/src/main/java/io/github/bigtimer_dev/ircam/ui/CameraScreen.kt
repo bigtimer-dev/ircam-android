@@ -160,8 +160,22 @@ private fun TopBar(vm: CameraViewModel, state: CamState, onSettings: () -> Unit)
                     style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
                 val fps = frame?.fps ?: 0.0
+                val link by vm.link.collectAsState()
                 Text(
-                    if (live != null) String.format(Locale.US, "%.0f fps", fps) + if (live.demo) " · simulated" else "" else "connecting",
+                    if (live != null) String.format(Locale.US, "%.0f fps", fps) + when {
+                        live.demo -> " · simulated"
+                        live.wireless -> link?.let { l ->
+                            buildString {
+                                append(" · WiFi")
+                                l.latencyMs?.let { append(String.format(Locale.US, " %.0f ms", it)) }
+                                if (l.loss >= 0.01) append(String.format(Locale.US, " · %.0f%% loss", l.loss * 100))
+                                l.rssiDbm?.let { append(" · $it dBm") }
+                                l.batteryPct?.let { append(String.format(Locale.US, " · %.0f%%", it)) }
+                                if (!l.cameraOk) append(" · no camera on bridge")
+                            }
+                        } ?: " · WiFi"
+                        else -> ""
+                    } else "connecting",
                     style = MaterialTheme.typography.bodySmall, color = Ui.TextDim,
                 )
             }

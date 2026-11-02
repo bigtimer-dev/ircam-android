@@ -32,6 +32,7 @@ fun IrcamApp(vm: CameraViewModel) {
     var screen by rememberSaveable { mutableStateOf("camera") }
     var showSettings by remember { mutableStateOf(false) }
     val state by vm.state.collectAsState()
+    val settings by vm.settings.collectAsState()
 
     LaunchedEffect(Unit) {
         vm.messages.collectLatest { snackbar.showSnackbar(it) }
@@ -59,6 +60,8 @@ fun IrcamApp(vm: CameraViewModel) {
                         onConnect = vm::connectCamera,
                         onDemo = vm::startDemo,
                         onGallery = { screen = "gallery" },
+                        wirelessHost = settings.wirelessHost,
+                        onWireless = vm::startWireless,
                     )
                     else -> CameraScreen(
                         vm = vm,

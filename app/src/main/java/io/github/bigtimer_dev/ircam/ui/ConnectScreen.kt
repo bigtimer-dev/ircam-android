@@ -24,12 +24,15 @@ import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Usb
+import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -42,7 +45,16 @@ import androidx.compose.ui.unit.dp
 import io.github.bigtimer_dev.ircam.CamState
 
 @Composable
-fun ConnectScreen(state: CamState.Idle, onConnect: () -> Unit, onDemo: () -> Unit, onGallery: () -> Unit) {
+fun ConnectScreen(
+    state: CamState.Idle,
+    onConnect: () -> Unit,
+    onDemo: () -> Unit,
+    onGallery: () -> Unit,
+    wirelessHost: String = "p2pro.local",
+    onWireless: (String) -> Unit = {},
+) {
+    var askHost by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(false) }
+    if (askHost) WirelessDialog(wirelessHost, onDismiss = { askHost = false }, onConnect = { askHost = false; onWireless(it) })
     Box(
         Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).verticalScroll(rememberScrollState()),
         contentAlignment = Alignment.Center,
@@ -77,6 +89,11 @@ fun ConnectScreen(state: CamState.Idle, onConnect: () -> Unit, onDemo: () -> Uni
                 Text(if (state.usbPresent) "Allow & connect" else "Connect camera", Modifier.padding(start = 8.dp))
             }
             Spacer(Modifier.height(10.dp))
+            OutlinedButton(onClick = { askHost = true }, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                Icon(Icons.Rounded.Wifi, null, Modifier.size(18.dp))
+                Text("Wireless camera", Modifier.padding(start = 6.dp))
+            }
+            Spacer(Modifier.height(10.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedButton(onClick = onDemo, modifier = Modifier.weight(1f).height(48.dp)) {
                     Icon(Icons.Rounded.PlayArrow, null, Modifier.size(18.dp))
@@ -97,6 +114,44 @@ fun ConnectScreen(state: CamState.Idle, onConnect: () -> Unit, onDemo: () -> Uni
             Text("Needs a phone with USB OTG (host) support.", style = MaterialTheme.typography.bodySmall, color = Ui.TextDim)
         }
     }
+}
+
+/** Asks for the wireless bridge's address. */
+@Composable
+private fun WirelessDialog(initial: String, onDismiss: () -> Unit, onConnect: (String) -> Unit) {
+    var text by androidx.compose.runtime.saveable.rememberSaveable { androidx.compose.runtime.mutableStateOf(initial) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Rounded.Wifi, null) },
+        title = { Text("Wireless camera") },
+        text = {
+            Column {
+                Text(
+                    "The P2 Pro on the Raspberry Pi bridge. At home use p2pro.local (or its IP address); " +
+                        "on the bridge's own hotspot (P2Pro-xxxx) use 10.42.0.1.",
+                    style = MaterialTheme.typography.bodyMedium, color = Ui.TextDim,
+                )
+                Spacer(Modifier.height(12.dp))
+                androidx.compose.material3.OutlinedTextField(
+                    value = text, onValueChange = { text = it }, singleLine = true,
+                    label = { Text("Bridge address") }, modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Uri,
+                        imeAction = androidx.compose.ui.text.input.ImeAction.Go,
+                    ),
+                    keyboardActions = androidx.compose.foundation.text.KeyboardActions(onGo = { onConnect(text) }),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (h in listOf("p2pro.local", "10.42.0.1")) {
+                        androidx.compose.material3.AssistChip(onClick = { text = h }, label = { Text(h) })
+                    }
+                }
+            }
+        },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = { onConnect(text) }) { Text("Connect") } },
+        dismissButton = { androidx.compose.material3.TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable
